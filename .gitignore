@@ -1,0 +1,14 @@
+# Real server inventory (copy from servers.example.txt)
+servers.txt
+
+# Orchestrator output: contains real hostnames, users and domains
+results/
+php2shell-consolidado.csv
+php2shell-reporte-*.md
+
+# Backups created by the agent if run locally
+*.bak-php2shell*
+*.pre-rollback-*
+
+# OS / editor
+.DS_Store

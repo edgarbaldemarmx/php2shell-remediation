@@ -1,0 +1,20 @@
+# servers.example.txt — lista de servidores / server list for php2shell-run-all.sh
+#
+# ES: Copia este archivo a servers.txt y llena tus servidores reales.
+#     servers.txt está en .gitignore: nunca subas hosts reales al repositorio.
+# EN: Copy this file to servers.txt and fill in your real servers.
+#     servers.txt is in .gitignore: never commit real hosts to the repository.
+#
+# Formato / Format: una línea por servidor / one line per server.
+# Líneas vacías y # comentarios se ignoran / Blank lines and # comments are ignored.
+#
+#   usuario@host              → puerto SSH 22 / SSH port 22
+#   usuario@host:2222         → puerto SSH custom / custom SSH port
+#
+# ES: Requiere acceso SSH por llaves (BatchMode, nunca pide contraseñas).
+#     Re-corre los servidores marcados SSH_FAIL en el CSV.
+# EN: Requires key-based SSH access (BatchMode, never asks for passwords).
+#     Re-run the servers marked SSH_FAIL in the CSV.
+
+usuario@servidor.ejemplo.com
+usuario@otro-servidor.ejemplo.com:2222
