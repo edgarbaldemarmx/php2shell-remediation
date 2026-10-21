@@ -30,9 +30,10 @@ Son dos scripts:
 Lo que hace el agente, paso a paso:
 
 1. 🔍 **Detecta** tu hosting: DreamHost, cPanel o genérico.
-2. 🔧 **Apaga** la función vulnerable: `session.upload_progress.enabled = 0` + `session.use_strict_mode = 1`
+2. 🔧 **Apaga** la función vulnerable: `session.upload_progress.enabled = 0` + `session.use_strict_mode = 1` + `fatal_error_backtraces = 0` (solo existe en PHP 8.5; versiones previas la ignoran)
    - DreamHost → un `phprc` por versión de PHP (`~/.php/<versión>/phprc`)
    - cPanel / genérico → un `.user.ini` en cada sitio
+   - DreamHost / cPanel → además `memory_limit = -1` (ver [Memoria](#es-mem))
 3. 🔐 **Protege** ese archivo con `.htaccess` para que nadie lo descargue desde internet.
 4. ✅ **Comprueba** que funcionó: pregunta a cada sitio vía HTTP con un archivo temporal que luego borra.
 5. 📝 **Reporta** el resultado.
@@ -101,6 +102,42 @@ Sirven para ambos scripts.
 | `--rollback` | ↩️ Restaura los respaldos y elimina lo que el script creó |
 | `--php-versions 8.3,8.4` | 🎯 Fuerza las versiones de PHP (DreamHost) si la detección no las encuentra |
 | `--domains s1.com,s2.com` | 🎯 Fuerza la lista de sitios (carpetas `~/<dominio>`) |
+| `--block-multipart` | 🧱 Además rechaza (403) todo `POST multipart/form-data` antes de PHP. ⚠️ **Rompe las subidas de archivos** (ver abajo) |
+| `--memory-unlimited` | 🧠 Fuerza `memory_limit = -1` también en genérico/VPS |
+| `--keep-memory-limit` | 🧠 No toca `memory_limit`, ni siquiera en DreamHost/cPanel |
+| `--post-max-size 8M` | 📦 Fija `post_max_size = 8M` y `upload_max_filesize = 7M`. ⚠️ Las subidas mayores dejan de funcionar |
+
+<a id="es-mem"></a>
+
+### 🧠 Memoria y tamaño de POST
+
+El advisory oficial del OOM ([GHSA-w8hw](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)) recomienda `memory_limit = -1` como mitigación principal de configuración y mantener `post_max_size` conservador. El script lo aplica según tu tipo de servidor:
+
+| Entorno | `memory_limit = -1` | Por qué |
+|---|---|---|
+| 🏢 DreamHost / cPanel (compartido) | ✅ Por defecto (`--keep-memory-limit` lo desactiva) | El proveedor limita la memoria por cuenta: un script descontrolado no tumba el servidor |
+| 🖥️ Genérico / VPS / dedicado | ⚪ Solo con `--memory-unlimited` | Sin un límite externo, un script podría agotar la RAM del servidor |
+
+- 📦 `post_max_size` siempre es opcional (`--post-max-size`): el advisory no da un número. Usa `8M` si los sitios no reciben archivos y `32M` si sí.
+- 🔁 En genérico, o con `--keep-memory-limit`, un `memory_limit` que ya pusiste tú no se toca. En DreamHost/cPanel se reemplaza por `-1` (el original queda en el respaldo). Para quitar el `-1` del script, usa `--rollback`.
+- ⚠️ Desde tu usuario no se puede fijar "administrativamente": una app puede bajarlo con `ini_set()` (WordPress no lo hace). La verificación avisa si el sitio no muestra `-1`.
+- 🖥️ **En un VPS o dedicado con root, parchea PHP.** Si no puedes hoy, configura en el pool de FPM (no con este script) siguiendo la [guía](docs/guia-remediacion.md#e-parámetros-del-advisory-oficial-memoria-y-tamaño-de-post).
+
+### 🧱 Bloqueo multipart (opcional)
+
+PHP procesa los formularios `multipart/form-data` aunque `session.upload_progress` esté apagado. Si el bug tiene otra ruta en ese parser, la mitigación de PHP no la cierra. `--block-multipart` corta esa ruta en Apache, **antes** de que el request llegue a PHP. La regla viene de [syhunt/php2shell-protection](https://github.com/syhunt/php2shell-protection).
+
+| ✅ Úsalo en | ❌ No lo uses en |
+|---|---|
+| Landing pages, sitios informativos, APIs sin archivos | WordPress con biblioteca de medios, tiendas, formularios con adjuntos |
+
+```bash
+./php2shell-run-all.sh servers.txt --block-multipart --domains landing.com,info.com
+```
+
+- 📌 La regla va **al inicio** del `.htaccess`. Al final no funcionaría: la regla `[L]` de WordPress termina el procesamiento antes.
+- ✅ La verificación manda un `POST` multipart de prueba a cada sitio y espera `403` (columna **Multipart** del reporte).
+- 🔁 Correr sin el flag **no lo quita**; solo `--rollback` lo elimina.
 
 ### 🚦 Cómo leer los resultados
 
@@ -118,9 +155,18 @@ Sirven para ambos scripts.
 | Estado | Significado |
 |--------|-------------|
 | 🟢 `OK` | Verificado: la función está apagada |
-| 🟡 `STALE` | Aún muestra el valor viejo; espera 5 min y re-corre `--verify` |
+| 🟡 `STALE` | Aún muestra el valor viejo (o el hosting fija otro `memory_limit` / `post_max_size`); espera 5 min y re-corre `--verify` |
 | 🟠 `UNREACHABLE` | No respondió por HTTP; verifícalo manualmente con `phpinfo()` |
 | 🔴 `ABSENT` | Esta build de PHP no tiene la directiva; revisa la versión |
+
+**Columna Multipart** (solo con `--block-multipart` o si el sitio ya tiene el bloque):
+
+| Valor | Significado |
+|-------|-------------|
+| 🟢 `BLOCKED` | El `POST` multipart recibió `403`: no llega a PHP |
+| 🔴 `OPEN` | Llegó a PHP: sin `mod_rewrite`, servidor nginx, o un `.htaccess` de subcarpeta lo anula |
+| 🟠 `ERROR` | El `POST` de prueba no obtuvo respuesta; verifícalo a mano |
+| ⚪ `-` | No se probó (o el sitio no respondió por HTTP) |
 
 > ⏱️ **Espera 5 minutos.** `.user.ini` tarda hasta **300 s** en recargarse. Justo después de aplicar es normal ver `STALE`; corre `--verify` cinco minutos después.
 
@@ -128,9 +174,10 @@ Sirven para ambos scripts.
 
 | Archivo | Acción | Respaldo |
 |---------|--------|----------|
-| `~/.php/<versión>/phprc` | Añade las 2 directivas | `phprc.bak-php2shell` |
-| `<sitio>/.user.ini` | Añade las 2 directivas (o lo crea) | `.user.ini.bak-php2shell` |
+| `~/.php/<versión>/phprc` | Añade las directivas | `phprc.bak-php2shell` |
+| `<sitio>/.user.ini` | Añade las directivas (o lo crea, con la línea `; php2shell mitigation` al inicio para reconocerlo en el rollback) | `.user.ini.bak-php2shell` |
 | `<sitio>/.htaccess` | Añade un bloque `# BEGIN/END php2shell protection` que bloquea el acceso web a `.user.ini*` | `.htaccess.bak-php2shell-<fecha>` |
+| `<sitio>/.htaccess` | Con `--block-multipart`: añade al inicio un bloque `# BEGIN/END php2shell multipart block` | (el mismo respaldo) |
 | Archivo de prueba | Se crea y **se borra solo** | — |
 
 - 🔁 **Puedes correrlo varias veces:** no duplica cambios, y un archivo ya mitigado no se toca.
@@ -142,13 +189,14 @@ Sirven para ambos scripts.
 - 🌐 **Verificación en `public_html`:** el dominio se deduce del nombre de la carpeta padre (el usuario), así que el sitio principal puede salir como `UNREACHABLE`. Verifícalo manualmente.
 - 📄 **`phprc` con secciones:** si tu `phprc` termina en una sección `[PATH=…]` o `[HOST=…]`, las directivas quedan dentro de esa sección. Revísalo a mano.
 - 🎯 **`--domains` en cPanel:** solo busca carpetas `~/<dominio>`, no rutas dentro de `public_html`.
+- 🧱 **`--block-multipart`:** requiere Apache o LiteSpeed con `mod_rewrite` (nginx ignora `.htaccess`). Si el sitio no usa ya `mod_rewrite` y el servidor tiene apagados `FollowSymLinks` y `SymLinksIfOwnerMatch`, Apache responde 403 a **todo** el sitio: pruébalo primero en un sitio y revisa que cargue. Una subcarpeta con su propio `.htaccess` y `RewriteEngine On` anula la regla para esa subcarpeta, y la verificación solo prueba la raíz del sitio.
 
 ### 📝 Lo que tienes que hacer tú
 
 - [ ] 🎫 **Ticket al proveedor** (DreamHost / cPanel / CloudLinux): ¿cuándo despliegan el PHP parcheado? ¿Hay backport para versiones antiguas?
 - [ ] ⬆️ **Actualizar PHP** a 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. En Debian/Ubuntu el fix llega backporteado y **el número de versión no cambia**: revisa el changelog de seguridad, no `php -v`.
 - [ ] 🧓 **PHP 5.x / 7.x / 8.0 / 8.1** no reciben parche: migra, aísla de internet o pide backport al proveedor.
-- [ ] 🧱 **WAF:** restringe `multipart/form-data` en rutas que no reciben archivos.
+- [ ] 🧱 **WAF:** restringe `multipart/form-data` en rutas que no reciben archivos (o usa `--block-multipart` en sitios sin subidas).
 - [ ] 👁️ **Detección:** alerta sobre procesos hijos raros de php-fpm, segfaults y conexiones salientes inesperadas.
 - [ ] ✅ Corre `--verify` otra vez después del parche.
 
@@ -182,9 +230,10 @@ There are two scripts:
 What the agent does, step by step:
 
 1. 🔍 **Detects** your hosting: DreamHost, cPanel or generic.
-2. 🔧 **Turns off** the vulnerable feature: `session.upload_progress.enabled = 0` + `session.use_strict_mode = 1`
+2. 🔧 **Turns off** the vulnerable feature: `session.upload_progress.enabled = 0` + `session.use_strict_mode = 1` + `fatal_error_backtraces = 0` (only exists in PHP 8.5; older versions ignore it)
    - DreamHost → one `phprc` per PHP version (`~/.php/<version>/phprc`)
    - cPanel / generic → one `.user.ini` per site
+   - DreamHost / cPanel → also `memory_limit = -1` (see [Memory](#en-mem))
 3. 🔐 **Protects** that file with `.htaccess` so nobody can download it from the web.
 4. ✅ **Checks** that it worked: asks each site over HTTP using a temporary file it deletes afterwards.
 5. 📝 **Reports** the result.
@@ -253,6 +302,42 @@ They work with both scripts.
 | `--rollback` | ↩️ Restores the backups and removes what the script created |
 | `--php-versions 8.3,8.4` | 🎯 Forces the PHP versions (DreamHost) when detection misses them |
 | `--domains s1.com,s2.com` | 🎯 Forces the site list (`~/<domain>` folders) |
+| `--block-multipart` | 🧱 Also rejects (403) every `POST multipart/form-data` before PHP. ⚠️ **Breaks file uploads** (see below) |
+| `--memory-unlimited` | 🧠 Forces `memory_limit = -1` on generic/VPS too |
+| `--keep-memory-limit` | 🧠 Leaves `memory_limit` alone, even on DreamHost/cPanel |
+| `--post-max-size 8M` | 📦 Sets `post_max_size = 8M` and `upload_max_filesize = 7M`. ⚠️ Larger uploads stop working |
+
+<a id="en-mem"></a>
+
+### 🧠 Memory and POST size
+
+The official OOM advisory ([GHSA-w8hw](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)) recommends `memory_limit = -1` as the primary configuration mitigation and keeping `post_max_size` conservative. The script applies it based on your server type:
+
+| Environment | `memory_limit = -1` | Why |
+|---|---|---|
+| 🏢 DreamHost / cPanel (shared) | ✅ By default (`--keep-memory-limit` turns it off) | The provider caps memory per account: a runaway script cannot take the server down |
+| 🖥️ Generic / VPS / dedicated | ⚪ Only with `--memory-unlimited` | Without an external limit, a script could exhaust the server's RAM |
+
+- 📦 `post_max_size` is always optional (`--post-max-size`): the advisory gives no number. Use `8M` if the sites don't accept files and `32M` if they do.
+- 🔁 On generic, or with `--keep-memory-limit`, a `memory_limit` you set yourself is left alone. On DreamHost/cPanel it is replaced by `-1` (the original stays in the backup). To remove the script's `-1`, use `--rollback`.
+- ⚠️ From your user account it cannot be set "administratively": an app can lower it with `ini_set()` (WordPress doesn't). Verification warns when the site does not show `-1`.
+- 🖥️ **On a VPS or dedicated server with root, patch PHP.** If you can't today, configure the FPM pool (not this script) following the [guide](docs/remediation-guide.md#e-official-advisory-parameters-memory-and-post-size).
+
+### 🧱 Multipart block (optional)
+
+PHP parses `multipart/form-data` forms even when `session.upload_progress` is off. If the bug has another path in that parser, the PHP mitigation does not close it. `--block-multipart` cuts that path in Apache, **before** the request reaches PHP. The rule comes from [syhunt/php2shell-protection](https://github.com/syhunt/php2shell-protection).
+
+| ✅ Use it on | ❌ Don't use it on |
+|---|---|
+| Landing pages, brochure sites, APIs without files | WordPress with a media library, shops, forms with attachments |
+
+```bash
+./php2shell-run-all.sh servers.txt --block-multipart --domains landing.com,info.com
+```
+
+- 📌 The rule goes **at the top** of `.htaccess`. At the bottom it would not work: WordPress's `[L]` rule stops processing first.
+- ✅ Verification sends a test multipart `POST` to each site and expects `403` (**Multipart** column in the report).
+- 🔁 Running without the flag **does not remove it**; only `--rollback` does.
 
 ### 🚦 Reading the results
 
@@ -270,9 +355,18 @@ They work with both scripts.
 | Status | Meaning |
 |--------|---------|
 | 🟢 `OK` | Verified: the feature is off |
-| 🟡 `STALE` | Still shows the old value; wait 5 min and run `--verify` again |
+| 🟡 `STALE` | Still shows the old value (or the host enforces another `memory_limit` / `post_max_size`); wait 5 min and run `--verify` again |
 | 🟠 `UNREACHABLE` | No HTTP response; check it manually with `phpinfo()` |
 | 🔴 `ABSENT` | This PHP build lacks the directive; check the version |
+
+**Multipart column** (only with `--block-multipart` or when the site already has the block):
+
+| Value | Meaning |
+|-------|---------|
+| 🟢 `BLOCKED` | The multipart `POST` got `403`: it never reaches PHP |
+| 🔴 `OPEN` | It reached PHP: no `mod_rewrite`, an nginx server, or a subfolder `.htaccess` overrides it |
+| 🟠 `ERROR` | The test `POST` got no response; check it manually |
+| ⚪ `-` | Not tested (or the site did not answer over HTTP) |
 
 > ⏱️ **Wait 5 minutes.** `.user.ini` takes up to **300 s** to reload. Seeing `STALE` right after applying is normal; run `--verify` five minutes later.
 
@@ -280,9 +374,10 @@ They work with both scripts.
 
 | File | Action | Backup |
 |------|--------|--------|
-| `~/.php/<version>/phprc` | Adds the 2 directives | `phprc.bak-php2shell` |
-| `<site>/.user.ini` | Adds the 2 directives (or creates it) | `.user.ini.bak-php2shell` |
+| `~/.php/<version>/phprc` | Adds the directives | `phprc.bak-php2shell` |
+| `<site>/.user.ini` | Adds the directives (or creates it, starting with a `; php2shell mitigation` line so rollback can recognize it) | `.user.ini.bak-php2shell` |
 | `<site>/.htaccess` | Adds a `# BEGIN/END php2shell protection` block that denies web access to `.user.ini*` | `.htaccess.bak-php2shell-<date>` |
+| `<site>/.htaccess` | With `--block-multipart`: adds a `# BEGIN/END php2shell multipart block` at the top | (same backup) |
 | Test file | Created and **deleted automatically** | — |
 
 - 🔁 **Safe to run repeatedly:** it never duplicates changes, and an already mitigated file is left alone.
@@ -294,13 +389,14 @@ They work with both scripts.
 - 🌐 **Verification on `public_html`:** the domain is guessed from the parent folder name (the username), so the main site may show `UNREACHABLE`. Check it manually.
 - 📄 **`phprc` with sections:** if your `phprc` ends with a `[PATH=…]` or `[HOST=…]` section, the directives land inside that section. Review it by hand.
 - 🎯 **`--domains` on cPanel:** it only looks for `~/<domain>` folders, not paths inside `public_html`.
+- 🧱 **`--block-multipart`:** needs Apache or LiteSpeed with `mod_rewrite` (nginx ignores `.htaccess`). If the site does not already use `mod_rewrite` and the server has both `FollowSymLinks` and `SymLinksIfOwnerMatch` off, Apache answers 403 to the **whole** site: try it on one site first and check that it loads. A subfolder with its own `.htaccess` and `RewriteEngine On` overrides the rule for that subfolder, and verification only tests the site root.
 
 ### 📝 What you still need to do
 
 - [ ] 🎫 **Ticket your provider** (DreamHost / cPanel / CloudLinux): when will patched PHP ship? Is there a backport for older versions?
 - [ ] ⬆️ **Upgrade PHP** to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. On Debian/Ubuntu the fix is backported and **the version number does not change**: check the security changelog, not `php -v`.
 - [ ] 🧓 **PHP 5.x / 7.x / 8.0 / 8.1** get no patch: migrate, isolate from the internet, or ask your provider for a backport.
-- [ ] 🧱 **WAF:** restrict `multipart/form-data` on routes that don't accept uploads.
+- [ ] 🧱 **WAF:** restrict `multipart/form-data` on routes that don't accept uploads (or use `--block-multipart` on sites without uploads).
 - [ ] 👁️ **Detection:** alert on unusual php-fpm child processes, segfaults and unexpected outbound connections.
 - [ ] ✅ Run `--verify` again after patching.
 
@@ -320,6 +416,9 @@ They work with both scripts.
 | 🧭 Reported vector / Vector | `session.upload_progress` (community; not officially confirmed) |
 
 - PHP — emergency release: https://www.php.net/archive/2026.php#2026-10-20-1
+- PHP — advisory "RCE via OOM corruption": https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w
+- PHP — advisory "RCE via stale global state": https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp
+- Syhunt — php2shell-protection (multipart rule): https://github.com/syhunt/php2shell-protection
 - Sansec — "PHP2Shell": https://sansec.io/research/php2shell
 - Huntress — Rapid Response: https://www.huntress.com/blog/php2shell-leaked-critical-php-vulnerabilities
 - SecureLayer7 — analysis: https://blog.securelayer7.net/php-rce-cve-2026-109618-109619/

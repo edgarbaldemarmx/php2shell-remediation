@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  php2shell-run-all.sh v2 — Orquestador paralelo de la mitigación php2shell
+#  php2shell-run-all.sh v3 — Orquestador paralelo de la mitigación php2shell
 #  (CVE-2026-109618 / CVE-2026-109619)
 #
 #  Corre php2shell-mitigate.sh en paralelo contra servers.txt y consolida
@@ -13,6 +13,9 @@
 #    ./php2shell-run-all.sh servers.txt --dry-run     # simular
 #    ./php2shell-run-all.sh servers.txt --php-versions 8.3,8.4
 #    ./php2shell-run-all.sh servers.txt --domains s1.com,s2.com
+#    ./php2shell-run-all.sh servers.txt --block-multipart --domains s1.com
+#    ./php2shell-run-all.sh servers.txt --memory-unlimited | --keep-memory-limit
+#    ./php2shell-run-all.sh servers.txt --post-max-size 8M
 #
 #  servers.txt — una línea por servidor:
 #    usuario@host            → conexión estándar
@@ -33,7 +36,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --verify|--rollback) MODE="${1#--}"; EXTRA_ARGS+=("$1") ;;
     --dry-run) DRY_RUN=1; EXTRA_ARGS+=("$1") ;;
-    --php-versions|--domains) EXTRA_ARGS+=("$1" "${2:-}"); shift ;;
+    --block-multipart|--memory-unlimited|--keep-memory-limit) EXTRA_ARGS+=("$1") ;;
+    --php-versions|--domains|--post-max-size) EXTRA_ARGS+=("$1" "${2:-}"); shift ;;
     *) echo "Opción desconocida: $1" >&2; exit 1 ;;
   esac
   shift
@@ -53,12 +57,12 @@ CSV="$HERE/php2shell-consolidado.csv"
 MAX_PARALLEL=5   # conexiones ssh simultáneas (ajustar si el firewall se queja)
 SSH_OPTS="-o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
 
-[ -z "$SERVERS_FILE" ] && { echo "Uso: $0 <servers.txt> [--verify|--rollback|--dry-run] [--php-versions 8.3,8.4] [--domains d1,d2]"; exit 1; }
+[ -z "$SERVERS_FILE" ] && { echo "Uso: $0 <servers.txt> [--verify|--rollback|--dry-run] [--php-versions 8.3,8.4] [--domains d1,d2] [--block-multipart] [--memory-unlimited|--keep-memory-limit] [--post-max-size 8M]"; exit 1; }
 [ -f "$AGENT" ] || { echo "ERROR: falta $AGENT (debe estar junto a este script)"; exit 1; }
 [ -f "$SERVERS_FILE" ] || { echo "ERROR: falta $SERVERS_FILE"; exit 1; }
 
 mkdir -p "$OUTDIR"
-echo "host,usuario,timestamp,modo,estado,phprc,userini,verified,failed,rollback,reporte" > "$CSV"
+echo "host,usuario,timestamp,modo,estado,phprc,userini,verified,failed,rollback,reporte,mp_blocked,mp_open,mp_error,mem" > "$CSV"
 
 # ---------------------------------------------------------------------------
 # Worker: envía el agente por stdin (sin copia en el /tmp remoto, que es
@@ -73,7 +77,7 @@ run_one(){
 
   echo "[$(date '+%H:%M:%S')] → $user@$host:$port (modo: $MODE_LABEL)"
   local tmplog="$OUTDIR/.tmp-${user}-${host}.log"
-  local estado="OK" phprc=0 userini=0 verified=0 failed=0 rollback=0 rep=""
+  local estado="OK" phprc=0 userini=0 verified=0 failed=0 rollback=0 mpblocked=0 mpopen=0 mperror=0 mem=0 rep=""
 
   local remote_out rc
   remote_out="$(ssh -p "$port" $SSH_OPTS "$user@$host" "bash -s -- ${EXTRA_ARGS[*]:-}" < "$AGENT" 2>&1)"
@@ -82,7 +86,7 @@ run_one(){
   # 255 = falló la conexión ssh (el agente solo sale con 0 o 1)
   if [ $rc -eq 255 ]; then
     echo "[$(date '+%H:%M:%S')] ✗ ssh falló a $host (¿llaves SSH?)" >&2
-    echo "$host,$user,$(date -Iseconds),$MODE_LABEL,SSH_FAIL,0,0,0,0,0," >> "$CSV"
+    echo "$host,$user,$(date -Iseconds),$MODE_LABEL,SSH_FAIL,0,0,0,0,0,,0,0,0," >> "$CSV"
     rm -f "$tmplog"; return 1
   fi
   [ $rc -ne 0 ] && estado="AGENT_ERROR"
@@ -100,6 +104,10 @@ run_one(){
         verified) verified="$v" ;;
         failed)   failed="$v" ;;
         rollback) rollback="$v" ;;
+        mpblocked) mpblocked="$v" ;;
+        mpopen)   mpopen="$v" ;;
+        mperror)  mperror="$v" ;;
+        mem)      mem="$v" ;;
         mode)     [ "$v" != "$MODE" ] && estado="MODE_MISMATCH" ;;
       esac
     done
@@ -112,16 +120,16 @@ run_one(){
   scp -P "$port" $SSH_OPTS -q "$user@$host:~/php2shell-reporte-*.md" "$rep" 2>/dev/null || rep=""
   ssh -p "$port" $SSH_OPTS "$user@$host" 'rm -f ~/php2shell-reporte-*.md' >/dev/null 2>&1 || true
 
-  echo "$host,$user,$(date -Iseconds),$MODE_LABEL,$estado,$phprc,$userini,$verified,$failed,$rollback,${rep##*/}" >> "$CSV"
+  echo "$host,$user,$(date -Iseconds),$MODE_LABEL,$estado,$phprc,$userini,$verified,$failed,$rollback,${rep##*/},$mpblocked,$mpopen,$mperror,$mem" >> "$CSV"
   rm -f "$tmplog"
-  echo "[$(date '+%H:%M:%S')] ✓ $host [$estado] phprc:$phprc userini:$userini verified:$verified failed:$failed rollback:$rollback"
+  echo "[$(date '+%H:%M:%S')] ✓ $host [$estado] phprc:$phprc userini:$userini verified:$verified failed:$failed rollback:$rollback$( [ $((mpblocked+mpopen+mperror)) -gt 0 ] && echo " mp:$mpblocked/$mpopen/$mperror")"
 }
 
 # ---------------------------------------------------------------------------
 # Paralelismo controlado
 # ---------------------------------------------------------------------------
 echo "============================================================"
-echo " php2shell run-all v2 | $(date '+%Y-%m-%d %H:%M:%S')"
+echo " php2shell run-all v3 | $(date '+%Y-%m-%d %H:%M:%S')"
 echo " servidores: $(grep -cve '^\s*$' -e '^\s*#' "$SERVERS_FILE") | paralelismo: $MAX_PARALLEL | modo: $MODE_LABEL"
 echo "============================================================"
 
@@ -146,9 +154,9 @@ awk -F',' 'NR>1 {
   tot++
   if ($5=="SSH_FAIL") sf++
   else if ($5!="OK") other++
-  ph+=$6; ui+=$7; ve+=$8; fa+=$9; ro+=$10
+  ph+=$6; ui+=$7; ve+=$8; fa+=$9; ro+=$10; mb+=$12; mo+=$13; me+=$14
 } END {
-  printf " servidores: %d | SSH_FAIL: %d | otros estados: %d\n phprc: %d | user.ini: %d | verificados: %d | fallidos: %d | rollback: %d\n", tot+0, sf+0, other+0, ph+0, ui+0, ve+0, fa+0, ro+0
+  printf " servidores: %d | SSH_FAIL: %d | otros estados: %d\n phprc: %d | user.ini: %d | verificados: %d | fallidos: %d | rollback: %d\n multipart bloqueado: %d | multipart abierto: %d | multipart error: %d\n", tot+0, sf+0, other+0, ph+0, ui+0, ve+0, fa+0, ro+0, mb+0, mo+0, me+0
 }' "$CSV"
 echo ""
 echo " CSV: $CSV | Detalle: $OUTDIR/"

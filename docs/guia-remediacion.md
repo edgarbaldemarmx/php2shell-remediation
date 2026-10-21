@@ -46,6 +46,7 @@ for v in /etc/php/*/fpm/conf.d; do
   cat > "$v/99-php2shell-mitigation.ini" <<'EOF'
 session.upload_progress.enabled = 0
 session.use_strict_mode = 1
+fatal_error_backtraces = 0
 EOF
 done
 systemctl reload php*-fpm
@@ -56,6 +57,8 @@ En pools específicos (`/etc/php/8.x/fpm/pool.d/*.conf`) alternativamente:
 ```ini
 php_admin_flag[session.upload_progress.enabled] = off
 php_admin_flag[session.use_strict_mode] = on
+; solo en pools de PHP 8.5: en versiones previas la directiva no existe
+php_admin_flag[fatal_error_backtraces] = off
 ```
 
 ### B. Apache con mod_php
@@ -65,6 +68,7 @@ Editar php.ini (o añadir a `.htaccess` para modo PERDIR):
 ```ini
 session.upload_progress.enabled = 0
 session.use_strict_mode = 1
+fatal_error_backtraces = 0
 ```
 ```bash
 apachectl configtest && systemctl restart apache2
@@ -78,6 +82,7 @@ apachectl configtest && systemctl restart apache2
   ```ini
   session.upload_progress.enabled = 0
   session.use_strict_mode = 1
+  fatal_error_backtraces = 0
   ```
   (surte efecto en ≤5 min por user_ini.cache_ttl; protegerlo con `.htaccess`: `<Files ".user.ini"> Require all denied </Files>`)
 - CloudLinux CageFS: recrear tras el cambio (`cagefsctl --force-update`).
@@ -86,13 +91,32 @@ apachectl configtest && systemctl restart apache2
 
 Añadir al dockerfile/entrypoint o montar un ini:
 ```bash
-echo -e "session.upload_progress.enabled=0\nsession.use_strict_mode=1" \
+echo -e "session.upload_progress.enabled=0\nsession.use_strict_mode=1\nfatal_error_backtraces=0" \
   > /usr/local/etc/php/conf.d/99-php2shell.ini
 ```
 Recrear contenedores; reconstruir imágenes que hardcodean versiones < 8.2.
 
+> `fatal_error_backtraces = 0` solo existe en PHP 8.5 y es la mitigación oficial del advisory [GHSA-6wmf-4rv5-p3rp](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp) para esa versión; en versiones previas PHP ignora la directiva. El advisory recomienda aplicar estos valores en `php.ini`, el pool de FPM o la config del servidor (al arranque) antes que en overrides por request, y reiniciar todos los workers.
+
 ### Impacto funcional: NINGUNO
 Solo desactiva las barras nativas de progreso de subida. WordPress, WooCommerce, Magento, Shopware, Laravel no las usan. `use_strict_mode` es la recomendación por defecto de PHP. Excepción: sesiones en Redis/DB no implementan el check de strict mode (el setting queda inofensivo/inoperante ahí).
+
+
+### E. Parámetros del advisory oficial (memoria y tamaño de POST)
+
+[GHSA-w8hw-w9fx-j79w](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w) (OOM) da como mitigación principal de configuración `memory_limit = -1`, fijado de forma administrativa. No es completa: solo actualizar lo es.
+
+| | 🏢 Hosting compartido (sin root) | 🖥️ VPS / dedicado (con root) |
+|---|---|---|
+| **Parche** | Lo instala el proveedor: abre un ticket | **Actualiza hoy**: es la única mitigación completa |
+| **`memory_limit = -1`** | En `phprc` / `.user.ini` (el script lo hace por defecto en DreamHost/cPanel). El proveedor limita la memoria por cuenta | En el pool: `php_admin_value[memory_limit] = -1`, **más** un límite externo (`MemoryMax` de systemd o el límite del contenedor) |
+| **`post_max_size`** | `.user.ini` / `phprc` (`--post-max-size 8M`) | `php.ini` o el pool, más un límite en el frontend: `client_max_body_size` (nginx) / `LimitRequestBody` (Apache) |
+| **Multipart** | `--block-multipart` en sitios sin subidas | Bloqueo en nginx/WAF en las rutas sin subidas |
+| **Workers** | DreamHost: el script recicla `php*.cgi` | Reinicia **todos** los workers; si el rendimiento lo permite, `pm.max_requests = 1` |
+
+- ⚠️ **No uses `ulimit -v` / `RLIMIT_AS` ni `RLIMIT_DATA`**: el advisory explica que hacen fallar `mmap()` y activan justo la ruta vulnerable.
+- Confirma que ningún pool, directorio o aplicación vuelva a poner un `memory_limit` finito.
+- Según el advisory, un límite por cgroup (`MemoryMax` / `memory.max`) puede ser una alternativa a `memory_limit`, pero no es una mitigación completa. Si se mata el cgroup o el contenedor, caen el master de FPM y todos sus workers, salvo que cada worker tenga su propio grupo.
 
 ---
 
@@ -106,6 +130,17 @@ Porque puede existir una segunda ruta en el parser multipart que corre aunque el
       limit_req zone=multipart burst=5 nodelay;  # ajustar a rutas con upload real
       ...
   }
+  ```
+- **Apache / LiteSpeed sin WAF** (regla de [syhunt/php2shell-protection](https://github.com/syhunt/php2shell-protection); el script la aplica con `--block-multipart`). Rechaza con 403 todo POST multipart **antes** de PHP y **rompe las subidas de archivos**: úsala solo en sitios sin uploads. Debe ir **al inicio** del `.htaccess`; al final, la regla `[L]` de WordPress la salta:
+  ```apache
+  # BEGIN php2shell multipart block
+  <IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteCond %{REQUEST_METHOD} ^POST$ [NC]
+    RewriteCond %{HTTP:Content-Type} ^[[:space:]]*multipart/form-data([;,[:space:]]|$) [NC]
+    RewriteRule ^ - [F,L]
+  </IfModule>
+  # END php2shell multipart block
   ```
 - **Bloquear multipart en rutas sin uploads** (wp-login.php, /api/*, /admin/* sin upload): regla WAF (ModSecurity / Cloudflare / AWS WAF) — `Content-Type: multipart/form-data` + URI no-lista → block/JS-challenge.
 - **ModSecurity**: subir paranoía y/o regla de rate por IP sobre POST multipart.
@@ -173,6 +208,7 @@ Si hay indicador de compromiso: aislar el host, preservar logs web+PHP, buscar w
     ```ini
     session.upload_progress.enabled = 0
     session.use_strict_mode = 1
+    fatal_error_backtraces = 0
     ```
   - Un phprc **por versión de PHP** en uso — repetir para cada versión que corra algún sitio
   - Reciclar procesos PHP para que tome efecto (matar `php<ver>.cgi` o esperar reciclaje; DreamHost lo documenta como paso obligatorio)
